@@ -9,6 +9,20 @@ import org.jboss.netty.channel.*;
 import org.jboss.netty.handler.codec.http.*;
 import org.jboss.netty.handler.stream.ChunkedFile;
 import org.jboss.netty.handler.stream.ChunkedStream;
+
+// websocket stuff
+import org.jboss.netty.handler.codec.http.websocket.*;
+import static org.jboss.netty.handler.codec.http.HttpHeaders.*;
+import static org.jboss.netty.handler.codec.http.HttpHeaders.Names.*;
+import static org.jboss.netty.handler.codec.http.HttpHeaders.Values.*;
+import static org.jboss.netty.handler.codec.http.HttpMethod.*;
+import static org.jboss.netty.handler.codec.http.HttpResponseStatus.*;
+import static org.jboss.netty.handler.codec.http.HttpVersion.*;
+import org.jboss.netty.handler.codec.http.HttpResponseStatus;
+import org.jboss.netty.handler.codec.http.HttpHeaders.Names;
+import org.jboss.netty.handler.codec.http.HttpHeaders.Values;
+import java.security.MessageDigest;
+
 import play.Invoker;
 import play.Logger;
 import play.Play;
@@ -49,10 +63,16 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
 
     private final static String signature = "Play! Framework;" + Play.version + ";" + Play.mode.name().toLowerCase();
 
+    public final static HttpMethod WEBSOCKET_METHOD = new HttpMethod("WEBSOCKET");
+
     public Request processRequest(Request request) {
         return request;
     }
 
+
+    private String getWebSocketLocation(HttpRequest req) {
+        return "ws://" + req.getHeader(HttpHeaders.Names.HOST) + req.getUri();
+    }
 
     @Override
     public void messageReceived(ChannelHandlerContext ctx, MessageEvent e) throws Exception {
@@ -62,18 +82,78 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
         if (msg instanceof HttpRequest) {
             final HttpRequest nettyRequest = (HttpRequest) msg;
             try {
+                // Serve the WebSocket handshake request.
+                if (Values.UPGRADE.equalsIgnoreCase(nettyRequest.getHeader(CONNECTION)) &&
+                    WEBOCKET.equalsIgnoreCase(nettyRequest.getHeader(Names.UPGRADE))) {
+                    try {
+                        // Create the WebSocket handshake response.
+                        HttpResponse res = new DefaultHttpResponse(
+                                                                   HTTP_1_1,
+                                                                   new HttpResponseStatus(101, "Web Socket Protocol Handshake"));
+                        res.addHeader(Names.UPGRADE, WEBSOCKET);
+                        res.addHeader(CONNECTION, Values.UPGRADE);
+
+                        // Fill in the headers and contents depending on handshake method.
+                        if (nettyRequest.containsHeader(SEC_WEBSOCKET_KEY1) &&
+                            nettyRequest.containsHeader(SEC_WEBSOCKET_KEY2)) {
+                            // New handshake method with a challenge:
+                            res.addHeader(SEC_WEBSOCKET_ORIGIN, nettyRequest.getHeader(ORIGIN));
+                            res.addHeader(SEC_WEBSOCKET_LOCATION, getWebSocketLocation(nettyRequest));
+                            String protocol = nettyRequest.getHeader(SEC_WEBSOCKET_PROTOCOL);
+                            if (protocol != null) {
+                                res.addHeader(SEC_WEBSOCKET_PROTOCOL, protocol);
+                            }
+
+                            // Calculate the answer of the challenge.
+                            String key1 = nettyRequest.getHeader(SEC_WEBSOCKET_KEY1);
+                            String key2 = nettyRequest.getHeader(SEC_WEBSOCKET_KEY2);
+                            int a = (int) (Long.parseLong(key1.replaceAll("[^0-9]", "")) / key1.replaceAll("[^ ]", "").length());
+                            int b = (int) (Long.parseLong(key2.replaceAll("[^0-9]", "")) / key2.replaceAll("[^ ]", "").length());
+                            long c = nettyRequest.getContent().readLong();
+                            ChannelBuffer input = ChannelBuffers.buffer(16);
+                            input.writeInt(a);
+                            input.writeInt(b);
+                            input.writeLong(c);
+                            ChannelBuffer output = ChannelBuffers.wrappedBuffer(
+                                                                                MessageDigest.getInstance("MD5").digest(input.array()));
+                            res.setContent(output);
+                        } else {
+                            // Old handshake method with no challenge:
+                            res.addHeader(WEBSOCKET_ORIGIN, nettyRequest.getHeader(ORIGIN));
+                            res.addHeader(WEBSOCKET_LOCATION, getWebSocketLocation(nettyRequest));
+                            String protocol = nettyRequest.getHeader(WEBSOCKET_PROTOCOL);
+                            if (protocol != null) {
+                                res.addHeader(WEBSOCKET_PROTOCOL, protocol);
+                            }
+                        }
+
+                        // Upgrade the connection and send the handshake response.
+                        ChannelPipeline p = ctx.getChannel().getPipeline();
+                        p.remove("aggregator");
+                        p.remove("chunkedWriter");
+                        p.replace("decoder", "wsdecoder", new WebSocketFrameDecoder());
+
+                        ctx.getChannel().write(res);
+
+                        p.replace("encoder", "wsencoder", new WebSocketFrameEncoder());
+                        nettyRequest.setMethod(WEBSOCKET_METHOD);
+                    } catch (Throwable t) {
+                        t.printStackTrace();
+                    }
+                }
                 Request request = parseRequest(ctx, nettyRequest);
                 request = processRequest(request);
 
                 final Response response = new Response();
-
                 Http.Response.current.set(response);
                 response.out = new ByteArrayOutputStream();
                 boolean raw = false;
-                for (PlayPlugin plugin : Play.plugins) {
-                    if (plugin.rawInvocation(request, response)) {
-                        raw = true;
-                        break;
+                if (nettyRequest.getMethod() != WEBSOCKET_METHOD) {
+                    for (PlayPlugin plugin : Play.plugins) {
+                        if (plugin.rawInvocation(request, response)) {
+                            raw = true;
+                            break;
+                        }
                     }
                 }
                 if (raw) {
@@ -81,10 +161,11 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
                 } else {
                     Invoker.invoke(new NettyInvocation(request, response, ctx, nettyRequest, e));
                 }
-
             } catch (Exception ex) {
                 serve500(ex, ctx, nettyRequest);
             }
+        } else if (msg instanceof WebSocketFrame) {
+            Logger.warn("got a websocket frame in play handler.  Didn't think this would happen")
         }
         Logger.trace("messageReceived: end");
     }
@@ -166,14 +247,29 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
 
             // Check the exceeded size before re rendering so we can render the error if the size is exceeded
             saveExceededSizeError(nettyRequest, request, response);
-            ActionInvoker.invoke(request, response);
+            if (nettyRequest.getMethod() == WEBSOCKET_METHOD) {
+                System.out.println("WEBSOCKET STUFF!!");
+                request.args.put("websocketChannel", ctx);
+                try {
+                    ActionInvoker.invoke(request, response);
+                } catch(Throwable t) {
+                    System.out.println("got an exception: " + t);
+                }
+            } else {
+                System.out.println("Got request " + nettyRequest.getMethod().toString());
+                ActionInvoker.invoke(request, response);
+            }
         }
 
         @Override
         public void onSuccess() throws Exception {
-            super.onSuccess();
-            copyResponse(ctx, request, response, nettyRequest);
-            Logger.trace("execute: end");
+            if (nettyRequest.getMethod() != WEBSOCKET_METHOD) {
+                super.onSuccess();
+                copyResponse(ctx, request, response, nettyRequest);
+                Logger.trace("execute: end");
+            } else {
+                ctx.getChannel().close();
+            }
         }
     }
 

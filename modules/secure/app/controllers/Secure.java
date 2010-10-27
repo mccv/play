@@ -63,7 +63,7 @@ public class Secure extends Controller {
             // This is the official method name
             allowed = (Boolean)Security.invoke("authenticate", username, password);
         }
-        if(validation.hasErrors() || !allowed) {
+        if((validation != null && validation.hasErrors()) || !allowed) {
             flash.keep("url");
             flash.error("secure.error");
             params.flash();
