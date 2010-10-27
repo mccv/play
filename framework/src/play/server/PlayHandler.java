@@ -84,7 +84,7 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
             try {
                 // Serve the WebSocket handshake request.
                 if (Values.UPGRADE.equalsIgnoreCase(nettyRequest.getHeader(CONNECTION)) &&
-                    WEBOCKET.equalsIgnoreCase(nettyRequest.getHeader(Names.UPGRADE))) {
+                    WEBSOCKET.equalsIgnoreCase(nettyRequest.getHeader(Names.UPGRADE))) {
                     try {
                         // Create the WebSocket handshake response.
                         HttpResponse res = new DefaultHttpResponse(
@@ -165,7 +165,7 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
                 serve500(ex, ctx, nettyRequest);
             }
         } else if (msg instanceof WebSocketFrame) {
-            Logger.warn("got a websocket frame in play handler.  Didn't think this would happen")
+            Logger.warn("got a websocket frame in play handler.  Didn't think this would happen");
         }
         Logger.trace("messageReceived: end");
     }
